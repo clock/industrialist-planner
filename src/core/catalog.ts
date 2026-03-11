@@ -1,4 +1,4 @@
-import { parseRecipeAmount } from "./amount";
+import { parseRecipeAmount, parseRecipeDuration } from "./amount";
 import { Catalog, Item, ItemId, Recipe, RecipeId } from "./types";
 
 export function createEmptyCatalog(): Catalog {
@@ -56,8 +56,12 @@ export function validateCatalog(catalog: Catalog): string[] {
     }
     recipeIds.add(recipe.id);
 
-    if (recipe.durationSec <= 0n) {
-      errors.push(`Recipe ${recipe.name} must have a positive duration.`);
+    try {
+      if (parseRecipeDuration(recipe.durationSec).compare(parseRecipeDuration(0n)) <= 0) {
+        errors.push(`Recipe ${recipe.name} must have a positive duration.`);
+      }
+    } catch {
+      errors.push(`Recipe ${recipe.name} has an invalid duration.`);
     }
     if (recipe.inputs.length === 0 && recipe.outputs.length === 0) {
       errors.push(`Recipe ${recipe.name} must have at least one input or output.`);
@@ -130,3 +134,6 @@ export function resolveItemByName(catalog: Catalog, raw: string): Item | undefin
     return item.aliases.some((alias) => alias.trim().toLowerCase() === normalized);
   });
 }
+
+
+

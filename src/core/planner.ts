@@ -1,4 +1,4 @@
-import { parseRecipeAmount } from "./amount";
+import { parseRecipeAmount, parseRecipeDuration } from "./amount";
 import {
   getCompactItemLabel,
   getItemById,
@@ -106,8 +106,8 @@ function getRecipeOutput(recipe: Recipe, itemId: ItemId) {
   return recipe.outputs.find((output) => output.itemId === itemId);
 }
 
-function getAmountPerSecond(amount: Recipe["inputs"][number]["amount"], durationSec: bigint): Rational {
-  return parseRecipeAmount(amount).div(Rational.fromBigInt(durationSec));
+function getAmountPerSecond(amount: Recipe["inputs"][number]["amount"], durationSec: Recipe["durationSec"]): Rational {
+  return parseRecipeAmount(amount).div(parseRecipeDuration(durationSec));
 }
 
 function getOutputRatePerMachine(recipe: Recipe, outputItemId: ItemId): Rational {
@@ -440,3 +440,6 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
 export function formatRate(rate: Rational): string {
   return `${rate.toDecimalString(4)}/s (${rate.toFractionString()}/s)`;
 }
+
+
+

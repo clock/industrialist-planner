@@ -23,7 +23,7 @@ import {
   PlannerResult,
   ProcessMachineRow,
 } from "../core/planner";
-import { formatRecipeAmount } from "../core/amount";
+import { formatRecipeAmount, formatRecipeDuration } from "../core/amount";
 import { CatalogStore, ChecklistStore } from "../core/storage";
 import { Rational } from "../core/rational";
 import { Catalog, Item, PlannerRequest, Recipe, RecipeIngredient } from "../core/types";
@@ -366,7 +366,7 @@ export class IndustrialistApp {
                   `${getItemById(this.catalog, output.itemId)?.name ?? output.itemId} x${formatRecipeAmount(output.amount)}`,
               )
               .join(", "),
-            `${recipe.durationSec.toString()}s`,
+            `${formatRecipeDuration(recipe.durationSec)}s`,
             recipe.inputs
               .map(
                 (input) =>
@@ -972,7 +972,7 @@ export class IndustrialistApp {
     }
     const durationRaw = await this.promptInput(
       "Duration in seconds",
-      existing?.durationSec.toString() ?? "1",
+      existing ? formatRecipeDuration(existing.durationSec) : "1",
     );
     if (!durationRaw) {
       return null;
@@ -995,8 +995,9 @@ export class IndustrialistApp {
     }
 
     try {
-      const durationSec = BigInt(durationRaw);
-      if (durationSec <= 0n) {
+      const durationSec = durationRaw.trim();
+      const parsedDuration = Rational.parse(durationSec);
+      if (parsedDuration.compare(Rational.zero()) <= 0) {
         throw new Error("Duration must be positive.");
       }
 
@@ -1070,6 +1071,7 @@ export function createAppWithDefaultStore(): IndustrialistApp {
     new ChecklistStore(path.join(process.cwd(), "data", "checklists.json")),
   );
 }
+
 
 
 

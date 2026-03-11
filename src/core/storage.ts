@@ -55,7 +55,7 @@ export function deserializeCatalog(serialized: SerializedCatalog): Catalog {
         id: recipe.id,
         name: recipe.name,
         machineName: recipe.machineName,
-        durationSec: BigInt(recipe.durationSec),
+        durationSec: recipe.durationSec,
         inputs: recipe.inputs.map((input) => ({
           itemId: input.itemId,
           amount: input.amount,
@@ -136,3 +136,4 @@ export class ChecklistStore {
     fs.writeFileSync(this.filePath, JSON.stringify({ entries }, null, 2), "utf8");
   }
 }
+

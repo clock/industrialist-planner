@@ -1,6 +1,7 @@
 export type ItemId = string;
 export type RecipeId = string;
 export type RecipeAmount = string | bigint;
+export type RecipeDuration = string | bigint;
 
 export interface Item {
   id: ItemId;
@@ -17,7 +18,7 @@ export interface Recipe {
   id: RecipeId;
   name: string;
   machineName: string;
-  durationSec: bigint;
+  durationSec: RecipeDuration;
   inputs: RecipeIngredient[];
   outputs: RecipeIngredient[];
 }
