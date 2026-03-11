@@ -1,0 +1,914 @@
+import blessed from "blessed";
+import type { Widgets } from "blessed";
+import path from "node:path";
+import {
+  createEmptyCatalog,
+  getItemById,
+  getRecipeById,
+  makeStableId,
+  resolveItemByName,
+  validateCatalog,
+} from "../core/catalog";
+import {
+  formatRate,
+  MissingRecipeSelectionError,
+  planFactory,
+  PlannerError,
+  PlannerResult,
+} from "../core/planner";
+import { CatalogStore } from "../core/storage";
+import { Catalog, Item, PlannerRequest, Recipe } from "../core/types";
+
+type KeyBinding = {
+  keys: string[];
+  listener: () => void;
+};
+
+type CatalogTab = "items" | "recipes";
+
+export class IndustrialistApp {
+  private readonly screen = blessed.screen({
+    smartCSR: true,
+    title: "Industrialist Planner",
+    fullUnicode: true,
+  });
+
+  private readonly header = blessed.box({
+    parent: this.screen,
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: 3,
+    border: "line",
+    tags: true,
+  });
+
+  private readonly body = blessed.box({
+    parent: this.screen,
+    top: 3,
+    left: 0,
+    width: "100%",
+    height: "100%-6",
+    border: "line",
+    tags: true,
+  });
+
+  private readonly footer = blessed.box({
+    parent: this.screen,
+    bottom: 0,
+    left: 0,
+    width: "100%",
+    height: 3,
+    border: "line",
+    tags: true,
+  });
+
+  private readonly bindings: KeyBinding[] = [];
+  private catalog: Catalog = createEmptyCatalog();
+  private currentTab: CatalogTab = "items";
+  private lastResult: PlannerResult | null = null;
+  private catalogSelection = {
+    items: 0,
+    recipes: 0,
+  };
+
+  constructor(private readonly store: CatalogStore) {}
+
+  async start(): Promise<void> {
+    this.catalog = this.store.load();
+    this.screen.key(["C-c"], () => {
+      this.screen.destroy();
+      process.exit(0);
+    });
+    this.showHome();
+  }
+
+  private clearViewBindings(): void {
+    while (this.bindings.length > 0) {
+      const binding = this.bindings.pop();
+      if (binding) {
+        for (const key of binding.keys) {
+          this.screen.unkey(key, binding.listener);
+        }
+      }
+    }
+  }
+
+  private bindViewKey(keys: string[], handler: () => void | Promise<void>): void {
+    const listener = () => {
+      void handler();
+    };
+    this.bindings.push({ keys, listener });
+    this.screen.key(keys, listener);
+  }
+
+  private setChrome(title: string, help: string): void {
+    this.header.setContent(` {bold}${title}{/bold} `);
+    this.footer.setContent(` ${help} `);
+  }
+
+  private clearBody(): void {
+    this.body.children
+      .slice()
+      .forEach((child: Widgets.Node) => child.destroy());
+  }
+
+  private async promptInput(label: string, initial = ""): Promise<string | null> {
+    return new Promise((resolve) => {
+      const prompt = blessed.prompt({
+        parent: this.screen,
+        border: "line",
+        width: "70%",
+        height: 9,
+        top: "center",
+        left: "center",
+        label: ` ${label} `,
+      });
+      prompt.input(label, initial, (_error: unknown, value: string | null) => {
+        prompt.destroy();
+        this.screen.render();
+        resolve(value === null ? null : value.trim());
+      });
+      this.screen.render();
+    });
+  }
+
+  private async promptChoice(title: string, items: string[]): Promise<number | null> {
+    return new Promise((resolve) => {
+      const wrapper = blessed.box({
+        parent: this.screen,
+        border: "line",
+        width: "70%",
+        height: Math.min(items.length + 4, 20),
+        top: "center",
+        left: "center",
+        label: ` ${title} `,
+      });
+
+      const list = blessed.list({
+        parent: wrapper,
+        top: 0,
+        left: 0,
+        width: "100%-2",
+        height: "100%-2",
+        keys: true,
+        vi: true,
+        mouse: true,
+        items,
+        style: {
+          selected: {
+            bg: "blue",
+          },
+        },
+      });
+
+      const finish = (value: number | null) => {
+        wrapper.destroy();
+        this.screen.render();
+        resolve(value);
+      };
+
+      list.on("select", (_item: Widgets.BlessedElement, index: number) => finish(index));
+      list.key(["escape", "q"], () => finish(null));
+      list.focus();
+      this.screen.render();
+    });
+  }
+
+  private async confirm(message: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const question = blessed.question({
+        parent: this.screen,
+        border: "line",
+        width: "70%",
+        height: 7,
+        top: "center",
+        left: "center",
+        label: " Confirm ",
+      });
+      question.ask(message, (answer: boolean) => {
+        question.destroy();
+        this.screen.render();
+        resolve(answer);
+      });
+      this.screen.render();
+    });
+  }
+
+  private async showMessage(title: string, message: string): Promise<void> {
+    return new Promise((resolve) => {
+      const box = blessed.message({
+        parent: this.screen,
+        border: "line",
+        width: "75%",
+        height: 9,
+        top: "center",
+        left: "center",
+        label: ` ${title} `,
+      });
+      box.display(message, 0, () => {
+        box.destroy();
+        this.screen.render();
+        resolve();
+      });
+      this.screen.render();
+    });
+  }
+
+  private showHome(): void {
+    this.clearViewBindings();
+    this.clearBody();
+    this.setChrome(
+      "Industrialist Planner",
+      "Enter select  q quit  c catalog  p planner  r results",
+    );
+
+    blessed.box({
+      parent: this.body,
+      top: 1,
+      left: 2,
+      width: "100%-4",
+      height: 5,
+      tags: true,
+      content:
+        "Define named items and recipes, then calculate the smallest whole-machine chain needed to run at full efficiency.",
+    });
+
+    const menu = blessed.list({
+      parent: this.body,
+      top: 7,
+      left: 2,
+      width: "60%",
+      height: 8,
+      border: "line",
+      keys: true,
+      vi: true,
+      mouse: true,
+      items: ["Catalog", "Planner", "Results", "Quit"],
+      style: {
+        selected: {
+          bg: "blue",
+        },
+      },
+    });
+
+    menu.on("select", (_item: Widgets.BlessedElement, index: number) => {
+      if (index === 0) {
+        this.showCatalog();
+      } else if (index === 1) {
+        this.showPlannerView();
+      } else if (index === 2) {
+        if (this.lastResult) {
+          this.showResults(this.lastResult);
+        } else {
+          void this.showMessage("No Results", "Run a planner calculation first.");
+        }
+      } else {
+        this.screen.destroy();
+        process.exit(0);
+      }
+    });
+
+    this.bindViewKey(["q"], () => {
+      this.screen.destroy();
+      process.exit(0);
+    });
+    this.bindViewKey(["c"], () => this.showCatalog());
+    this.bindViewKey(["p"], () => this.showPlannerView());
+    this.bindViewKey(["r"], async () => {
+      if (this.lastResult) {
+        this.showResults(this.lastResult);
+      } else {
+        await this.showMessage("No Results", "Run a planner calculation first.");
+      }
+    });
+
+    menu.focus();
+    this.screen.render();
+  }
+
+  private showCatalog(): void {
+    this.clearViewBindings();
+    this.clearBody();
+    this.setChrome(
+      `Catalog: ${this.currentTab}`,
+      "Tab switch  a add  e edit  d delete  p planner  q home",
+    );
+
+    const errors = validateCatalog(this.catalog);
+    blessed.box({
+      parent: this.body,
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: 3,
+      tags: true,
+      content:
+        errors.length > 0
+          ? `{red-fg}${errors[0]}{/red-fg}`
+          : `{green-fg}${this.catalog.items.length} items, ${this.catalog.recipes.length} recipes{/green-fg}`,
+    });
+
+    const table = blessed.listtable({
+      parent: this.body,
+      top: 3,
+      left: 0,
+      width: "100%",
+      height: "100%-3",
+      border: "line",
+      keys: true,
+      vi: true,
+      mouse: true,
+      style: {
+        header: {
+          fg: "yellow",
+          bold: true,
+        },
+        cell: {
+          selected: {
+            bg: "blue",
+          },
+        },
+      },
+    });
+
+    const render = () => {
+      if (this.currentTab === "items") {
+        table.setData([
+          ["Name", "Aliases", "Id"],
+          ...this.catalog.items.map((item) => [item.name, item.aliases.join(", "), item.id]),
+        ]);
+      } else {
+        table.setData([
+          ["Recipe", "Machine", "Output", "Duration", "Inputs"],
+          ...this.catalog.recipes.map((recipe) => [
+            recipe.name,
+            recipe.machineName,
+            `${getItemById(this.catalog, recipe.output.itemId)?.name ?? recipe.output.itemId} x${recipe.output.amount.toString()}`,
+            `${recipe.durationSec.toString()}s`,
+            recipe.inputs
+              .map(
+                (input) =>
+                  `${getItemById(this.catalog, input.itemId)?.name ?? input.itemId} x${input.amount.toString()}`,
+              )
+              .join(", "),
+          ]),
+        ]);
+      }
+      this.screen.render();
+    };
+
+    const getRowsForCurrentTab = () =>
+      this.currentTab === "items" ? this.catalog.items : this.catalog.recipes;
+
+    const getSelectedIndex = () => {
+      const rows = getRowsForCurrentTab();
+      if (rows.length === 0) {
+        return -1;
+      }
+      const storedIndex =
+        this.currentTab === "items"
+          ? this.catalogSelection.items
+          : this.catalogSelection.recipes;
+      return Math.max(0, Math.min(storedIndex, rows.length - 1));
+    };
+
+    const setSelection = (index: number) => {
+      const currentIndex = Math.max(index, 0);
+      if (this.currentTab === "items") {
+        this.catalogSelection.items = currentIndex;
+      } else {
+        this.catalogSelection.recipes = currentIndex;
+      }
+    };
+
+    this.bindViewKey(["tab"], () => {
+      this.currentTab = this.currentTab === "items" ? "recipes" : "items";
+      this.showCatalog();
+    });
+    this.bindViewKey(["q"], () => this.showHome());
+    this.bindViewKey(["p"], () => this.showPlannerView());
+    this.bindViewKey(["a"], async () => {
+      if (this.currentTab === "items") {
+        await this.addItem();
+      } else {
+        await this.addRecipe();
+      }
+      render();
+    });
+    this.bindViewKey(["e"], async () => {
+      if (this.currentTab === "items") {
+        const item = this.catalog.items[getSelectedIndex()];
+        if (item) {
+          await this.editItem(item);
+        }
+      } else {
+        const recipe = this.catalog.recipes[getSelectedIndex()];
+        if (recipe) {
+          await this.editRecipe(recipe);
+        }
+      }
+      render();
+      if (getSelectedIndex() >= 0) {
+        table.select(getSelectedIndex() + 1);
+      }
+    });
+    this.bindViewKey(["d"], async () => {
+      if (this.currentTab === "items") {
+        const item = this.catalog.items[getSelectedIndex()];
+        if (item) {
+          await this.deleteItem(item);
+        }
+      } else {
+        const recipe = this.catalog.recipes[getSelectedIndex()];
+        if (recipe) {
+          await this.deleteRecipe(recipe);
+        }
+      }
+      render();
+      if (getSelectedIndex() >= 0) {
+        table.select(getSelectedIndex() + 1);
+      }
+    });
+    table.key(["enter"], async () => {
+      if (this.currentTab === "items") {
+        const item = this.catalog.items[getSelectedIndex()];
+        if (item) {
+          await this.editItem(item);
+        }
+      } else {
+        const recipe = this.catalog.recipes[getSelectedIndex()];
+        if (recipe) {
+          await this.editRecipe(recipe);
+        }
+      }
+      render();
+      if (getSelectedIndex() >= 0) {
+        table.select(getSelectedIndex() + 1);
+      }
+    });
+
+    table.on("select", (_item: Widgets.BlessedElement, index: number) => {
+      setSelection(index - 1);
+    });
+
+    render();
+    if (getSelectedIndex() >= 0) {
+      table.select(getSelectedIndex() + 1);
+    }
+    table.focus();
+  }
+
+  private showPlannerView(): void {
+    this.clearViewBindings();
+    this.clearBody();
+    this.setChrome("Planner Setup", "Enter or p run plan  q home");
+
+    blessed.box({
+      parent: this.body,
+      top: 1,
+      left: 2,
+      width: "100%-4",
+      height: 4,
+      content:
+        "Select the end recipe you want to plan around. The wizard will ask for either machine count or target output per second, then resolve alternative upstream recipes if needed.",
+    });
+
+    const list = blessed.list({
+      parent: this.body,
+      top: 6,
+      left: 2,
+      width: "80%",
+      height: "100%-8",
+      border: "line",
+      keys: true,
+      vi: true,
+      mouse: true,
+      items: this.catalog.recipes.map(
+        (recipe) => `${recipe.name} -> ${getItemById(this.catalog, recipe.output.itemId)?.name ?? recipe.output.itemId}`,
+      ),
+      style: {
+        selected: {
+          bg: "blue",
+        },
+      },
+    });
+
+    const run = async () => {
+      const recipe = this.catalog.recipes[
+        (list as unknown as { selected: number }).selected ?? 0
+      ];
+      if (!recipe) {
+        return;
+      }
+      await this.runPlannerWizard(recipe);
+    };
+
+    this.bindViewKey(["q"], () => this.showHome());
+    this.bindViewKey(["p"], run);
+    list.key(["enter"], () => {
+      void run();
+    });
+    list.focus();
+    this.screen.render();
+  }
+
+  private async runPlannerWizard(rootRecipe: Recipe): Promise<void> {
+    const targetModeIndex = await this.promptChoice("Target mode", [
+      "Machine count",
+      "Output per second",
+    ]);
+    if (targetModeIndex === null) {
+      this.showPlannerView();
+      return;
+    }
+
+    const targetMode = targetModeIndex === 0 ? "machineCount" : "outputPerSecond";
+    const targetValue = await this.promptInput(
+      targetMode === "machineCount" ? "Desired machine count" : "Desired output per second",
+      "1",
+    );
+    if (!targetValue) {
+      this.showPlannerView();
+      return;
+    }
+
+    const request: PlannerRequest = {
+      rootRecipeId: rootRecipe.id,
+      targetMode,
+      targetValue,
+      recipeSelections: {},
+    };
+
+    while (true) {
+      try {
+        const result = planFactory(this.catalog, request);
+        this.lastResult = result;
+        this.showResults(result);
+        return;
+      } catch (error) {
+        if (error instanceof MissingRecipeSelectionError) {
+          const item = getItemById(this.catalog, error.itemId);
+          const index = await this.promptChoice(
+            `Select producer for ${item?.name ?? error.itemId}`,
+            error.producerRecipeIds.map((recipeId) => {
+              const recipe = getRecipeById(this.catalog, recipeId);
+              return `${recipe?.name ?? recipeId} (${recipe?.machineName ?? "machine"})`;
+            }),
+          );
+          if (index === null) {
+            this.showPlannerView();
+            return;
+          }
+          request.recipeSelections[error.itemId] = error.producerRecipeIds[index];
+          continue;
+        }
+
+        const message =
+          error instanceof PlannerError ? error.message : "Unexpected planner failure.";
+        await this.showMessage("Planner Error", message);
+        this.showPlannerView();
+        return;
+      }
+    }
+  }
+
+  private showResults(result: PlannerResult): void {
+    this.clearViewBindings();
+    this.clearBody();
+    this.setChrome("Results", "q home  p planner");
+
+    const rootRecipe = getRecipeById(this.catalog, result.rootRecipeId);
+    blessed.box({
+      parent: this.body,
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: 4,
+      tags: true,
+      content:
+        `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold}\n` +
+        `Scale factor: ${result.scaleFactor.toString()}\n` +
+        `Achieved output: ${formatRate(result.achievedOutputPerSecond)}`,
+    });
+
+    blessed.listtable({
+      parent: this.body,
+      top: 4,
+      left: 0,
+      width: "60%",
+      height: "50%-2",
+      border: "line",
+      label: " Machine Counts ",
+      data: [
+        ["Recipe", "Machine", "Exact", "Scaled", "Output/sec"],
+        ...result.recipeSummaries.map((summary) => [
+          summary.recipeName,
+          summary.machineName,
+          summary.exactMachineCount.toFractionString(),
+          summary.scaledMachineCount.toString(),
+          summary.outputPerSecond.toDecimalString(4),
+        ]),
+      ],
+      style: {
+        header: {
+          fg: "yellow",
+          bold: true,
+        },
+      },
+    });
+
+    blessed.listtable({
+      parent: this.body,
+      top: 4,
+      left: "60%",
+      width: "40%",
+      height: "50%-2",
+      border: "line",
+      label: " External Sources ",
+      data: [
+        ["Item", "Exact/sec", "Scaled/sec"],
+        ...result.externalSources.map((source) => [
+          source.itemName,
+          source.exactRate.toFractionString(),
+          source.scaledRate.toDecimalString(4),
+        ]),
+      ],
+      style: {
+        header: {
+          fg: "yellow",
+          bold: true,
+        },
+      },
+    });
+
+    blessed.box({
+      parent: this.body,
+      top: "50%+2",
+      left: 0,
+      width: "100%",
+      height: "50%-2",
+      border: "line",
+      label: " Dependency Tree ",
+      scrollable: true,
+      alwaysScroll: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      content: this.renderDependencyTree(result),
+    });
+
+    this.bindViewKey(["q"], () => this.showHome());
+    this.bindViewKey(["p"], () => this.showPlannerView());
+    this.screen.render();
+  }
+
+  private renderDependencyTree(result: PlannerResult): string {
+    const lines: string[] = [];
+    const visited = new Set<string>();
+
+    const visit = (recipeId: string, depth: number) => {
+      const recipe = getRecipeById(this.catalog, recipeId);
+      const summary = result.recipeSummaries.find((entry) => entry.recipeId === recipeId);
+      if (!recipe || !summary) {
+        return;
+      }
+
+      const indent = "  ".repeat(depth);
+      lines.push(`${indent}${recipe.name} [${summary.scaledMachineCount.toString()} ${recipe.machineName}]`);
+
+      for (const edge of result.dependencyGraph[recipeId] ?? []) {
+        const itemIndent = "  ".repeat(depth + 1);
+        if (!edge.producerRecipeId) {
+          const external = result.externalSources.find((source) => source.itemId === edge.itemId);
+          lines.push(
+            `${itemIndent}${edge.itemName}: external ${
+              external ? external.scaledRate.toDecimalString(4) : "0"
+            }/s`,
+          );
+          continue;
+        }
+
+        lines.push(`${itemIndent}${edge.itemName}`);
+        const key = `${recipeId}->${edge.producerRecipeId}`;
+        if (!visited.has(key)) {
+          visited.add(key);
+          visit(edge.producerRecipeId, depth + 2);
+        }
+      }
+    };
+
+    visit(result.rootRecipeId, 0);
+    return lines.join("\n");
+  }
+
+  private async addItem(): Promise<void> {
+    const name = await this.promptInput("Item name");
+    if (!name) {
+      return;
+    }
+    const aliasesInput = await this.promptInput("Aliases (comma-separated)", "");
+    if (aliasesInput === null) {
+      return;
+    }
+
+    this.catalog.items.push({
+      id: makeStableId(name, this.catalog.items.map((item) => item.id)),
+      name,
+      aliases: parseAliases(aliasesInput),
+    });
+    this.persistCatalog();
+  }
+
+  private async editItem(item: Item): Promise<void> {
+    const name = await this.promptInput("Item name", item.name);
+    if (!name) {
+      return;
+    }
+    const aliasesInput = await this.promptInput(
+      "Aliases (comma-separated)",
+      item.aliases.join(", "),
+    );
+    if (aliasesInput === null) {
+      return;
+    }
+
+    item.name = name;
+    item.aliases = parseAliases(aliasesInput);
+    this.persistCatalog();
+  }
+
+  private async deleteItem(item: Item): Promise<void> {
+    const used = this.catalog.recipes.some(
+      (recipe) =>
+        recipe.output.itemId === item.id || recipe.inputs.some((input) => input.itemId === item.id),
+    );
+    if (used) {
+      await this.showMessage("Cannot Delete", "This item is still used by one or more recipes.");
+      return;
+    }
+    if (!(await this.confirm(`Delete item "${item.name}"?`))) {
+      return;
+    }
+    this.catalog.items = this.catalog.items.filter((entry) => entry.id !== item.id);
+    this.persistCatalog();
+  }
+
+  private async addRecipe(): Promise<void> {
+    if (this.catalog.items.length === 0) {
+      await this.showMessage("No Items", "Create items first so recipe inputs can reference them.");
+      return;
+    }
+
+    const fields = await this.collectRecipeFields();
+    if (!fields) {
+      return;
+    }
+
+    this.catalog.recipes.push({
+      id: makeStableId(fields.name, this.catalog.recipes.map((recipe) => recipe.id)),
+      ...fields,
+    });
+    this.persistCatalog();
+  }
+
+  private async editRecipe(recipe: Recipe): Promise<void> {
+    const fields = await this.collectRecipeFields(recipe);
+    if (!fields) {
+      return;
+    }
+
+    recipe.name = fields.name;
+    recipe.machineName = fields.machineName;
+    recipe.durationSec = fields.durationSec;
+    recipe.inputs = fields.inputs;
+    recipe.output = fields.output;
+    this.persistCatalog();
+  }
+
+  private async deleteRecipe(recipe: Recipe): Promise<void> {
+    if (!(await this.confirm(`Delete recipe "${recipe.name}"?`))) {
+      return;
+    }
+    this.catalog.recipes = this.catalog.recipes.filter((entry) => entry.id !== recipe.id);
+    this.persistCatalog();
+  }
+
+  private async collectRecipeFields(existing?: Recipe): Promise<Omit<Recipe, "id"> | null> {
+    const name = await this.promptInput("Recipe name", existing?.name ?? "");
+    if (!name) {
+      return null;
+    }
+    const machineName = await this.promptInput("Machine name", existing?.machineName ?? "");
+    if (!machineName) {
+      return null;
+    }
+    const durationRaw = await this.promptInput(
+      "Duration in seconds",
+      existing?.durationSec.toString() ?? "1",
+    );
+    if (!durationRaw) {
+      return null;
+    }
+
+    const outputItemRaw = await this.promptInput(
+      "Output item name or alias",
+      existing ? getItemById(this.catalog, existing.output.itemId)?.name ?? "" : "",
+    );
+    if (!outputItemRaw) {
+      return null;
+    }
+
+    const outputAmountRaw = await this.promptInput(
+      "Output amount",
+      existing?.output.amount.toString() ?? "1",
+    );
+    if (!outputAmountRaw) {
+      return null;
+    }
+
+    const inputsRaw = await this.promptInput(
+      "Inputs as item:amount, item:amount",
+      existing
+        ? existing.inputs
+            .map(
+              (input) =>
+                `${getItemById(this.catalog, input.itemId)?.name ?? input.itemId}:${input.amount.toString()}`,
+            )
+            .join(", ")
+        : "",
+    );
+    if (inputsRaw === null) {
+      return null;
+    }
+
+    try {
+      const durationSec = BigInt(durationRaw);
+      const outputAmount = BigInt(outputAmountRaw);
+      if (durationSec <= 0n || outputAmount <= 0n) {
+        throw new Error("Duration and output amount must be positive.");
+      }
+      const outputItem = resolveItemByName(this.catalog, outputItemRaw);
+      if (!outputItem) {
+        throw new Error(`Unknown output item "${outputItemRaw}".`);
+      }
+
+      return {
+        name,
+        machineName,
+        durationSec,
+        output: {
+          itemId: outputItem.id,
+          amount: outputAmount,
+        },
+        inputs: this.parseRecipeInputs(inputsRaw),
+      };
+    } catch (error) {
+      await this.showMessage("Invalid Recipe", (error as Error).message);
+      return null;
+    }
+  }
+
+  private parseRecipeInputs(raw: string): Recipe["inputs"] {
+    if (!raw.trim()) {
+      return [];
+    }
+    return raw.split(",").map((chunk) => {
+      const [itemToken, amountToken] = chunk.split(":");
+      if (!itemToken || !amountToken) {
+        throw new Error(`Invalid input "${chunk.trim()}". Use item:amount.`);
+      }
+      const item = resolveItemByName(this.catalog, itemToken);
+      if (!item) {
+        throw new Error(`Unknown item "${itemToken.trim()}".`);
+      }
+      const amount = BigInt(amountToken.trim());
+      if (amount <= 0n) {
+        throw new Error(`Input amount for "${item.name}" must be positive.`);
+      }
+      return {
+        itemId: item.id,
+        amount,
+      };
+    });
+  }
+
+  private persistCatalog(): void {
+    const errors = validateCatalog(this.catalog);
+    if (errors.length > 0) {
+      throw new Error(errors[0]);
+    }
+    this.store.save(this.catalog);
+  }
+}
+
+function parseAliases(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+export function createAppWithDefaultStore(): IndustrialistApp {
+  return new IndustrialistApp(new CatalogStore(path.join(process.cwd(), "data", "catalog.json")));
+}

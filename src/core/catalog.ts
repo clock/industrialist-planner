@@ -1,0 +1,100 @@
+import { Catalog, Item, ItemId, Recipe, RecipeId } from "./types";
+
+export function createEmptyCatalog(): Catalog {
+  return {
+    schemaVersion: 1,
+    items: [],
+    recipes: [],
+  };
+}
+
+export function makeStableId(name: string, existingIds: Iterable<string>): string {
+  const base =
+    name
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "entry";
+
+  const used = new Set(existingIds);
+  if (!used.has(base)) {
+    return base;
+  }
+
+  let counter = 2;
+  while (used.has(`${base}-${counter}`)) {
+    counter += 1;
+  }
+  return `${base}-${counter}`;
+}
+
+export function validateCatalog(catalog: Catalog): string[] {
+  const errors: string[] = [];
+  const itemIds = new Set<ItemId>();
+  const recipeIds = new Set<RecipeId>();
+
+  for (const item of catalog.items) {
+    if (!item.name.trim()) {
+      errors.push(`Item ${item.id} is missing a name.`);
+    }
+    if (itemIds.has(item.id)) {
+      errors.push(`Duplicate item id: ${item.id}`);
+    }
+    itemIds.add(item.id);
+  }
+
+  for (const recipe of catalog.recipes) {
+    if (!recipe.name.trim()) {
+      errors.push(`Recipe ${recipe.id} is missing a name.`);
+    }
+    if (!recipe.machineName.trim()) {
+      errors.push(`Recipe ${recipe.name} is missing a machine name.`);
+    }
+    if (recipeIds.has(recipe.id)) {
+      errors.push(`Duplicate recipe id: ${recipe.id}`);
+    }
+    recipeIds.add(recipe.id);
+
+    if (recipe.durationSec <= 0n) {
+      errors.push(`Recipe ${recipe.name} must have a positive duration.`);
+    }
+    if (recipe.output.amount <= 0n) {
+      errors.push(`Recipe ${recipe.name} must have a positive output amount.`);
+    }
+    if (!itemIds.has(recipe.output.itemId)) {
+      errors.push(`Recipe ${recipe.name} output item does not exist.`);
+    }
+    for (const input of recipe.inputs) {
+      if (input.amount <= 0n) {
+        errors.push(`Recipe ${recipe.name} has a non-positive input amount.`);
+      }
+      if (!itemIds.has(input.itemId)) {
+        errors.push(`Recipe ${recipe.name} input item does not exist.`);
+      }
+    }
+  }
+
+  return errors;
+}
+
+export function getItemById(catalog: Catalog, itemId: ItemId): Item | undefined {
+  return catalog.items.find((item) => item.id === itemId);
+}
+
+export function getRecipeById(catalog: Catalog, recipeId: RecipeId): Recipe | undefined {
+  return catalog.recipes.find((recipe) => recipe.id === recipeId);
+}
+
+export function getRecipeProducers(catalog: Catalog, itemId: ItemId): Recipe[] {
+  return catalog.recipes.filter((recipe) => recipe.output.itemId === itemId);
+}
+
+export function resolveItemByName(catalog: Catalog, raw: string): Item | undefined {
+  const normalized = raw.trim().toLowerCase();
+  return catalog.items.find((item) => {
+    if (item.name.trim().toLowerCase() === normalized) {
+      return true;
+    }
+    return item.aliases.some((alias) => alias.trim().toLowerCase() === normalized);
+  });
+}
